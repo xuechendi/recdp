@@ -329,6 +329,84 @@ class FeatureAdd(Operation):
         return df
 
 
+class BinaryClassify(Operation):
+    '''
+    Operation to perform BinaryClassify to columns
+
+    Args:
+
+        cols (dict or list): columns which are be modified
+        default: filled default value
+    '''
+
+    def __init__(self, cols):
+        self.op_name = "BinaryClassify"
+        self.feature_op = None
+        if isinstance(cols, list):
+            op_list = {}
+            for c_name in cols:
+                op_list[c_name] = f"f.when(f.col('{c_name}') > 0, 1).otherwise(0)"
+            self.feature_op = FeatureModification(cols=op_list, op='inline')
+        elif isinstance(cols, dict):
+            op_list = {}
+            for n_c, o_c in cols.items():
+                op_list[n_c] = f"f.when(f.col('{o_c}') > 0, 1).otherwise(0)"
+            self.feature_op = FeatureAdd(cols=op_list, op='inline')
+        else:
+            raise ValueError(f"{self.op_name} only supports input as list or dict")
+
+    def process(self, df, spark, df_cnt, enable_scala=True, save_path="", per_core_memory_size=0, flush_threshold = 0, enable_gazelle=False):
+        if self.feature_op:
+            df = self.feature_op.process(df, spark, df_cnt, enable_scala, save_path, per_core_memory_size, flush_threshold, enable_gazelle)
+        return df
+
+
+class SentenceEmbedding(Operation):
+    '''
+    Operation to perform SentenceEmbedding to columns
+
+    Args:
+
+        cols (dict or list): columns which are be modified
+        need_decode: does sentence also need decode
+    '''
+
+    def __init__(self, cols, model_name="distiluse-base-multilingual-cased", need_decode=False):
+        self.op_name = "SentenceEmbedding"
+        if need_decode:
+            from transformers import BertTokenizer
+            tokenizer = BertTokenizer.from_pretrained(
+                    'bert-base-multilingual-cased', do_lower_case=False)
+            # define UDF
+            tokenizer_decode = f.udf(lambda x: tokenizer.decode(
+                [int(n) for n in x.split('\t')]) if len(x) > 0 else [])
+
+        from sentence_transformers import SentenceTransformer
+        from os import path
+        if not path.exists(f"{model_name}-pretrained-model"):
+            sbert_model = SentenceTransformer(model_name)
+            sbert_model.save(f"{model_name}-pretrained-model")
+        else:
+            sbert_model = SentenceTransformer(f"{model_name}-pretrained-model")
+        if need_decode:
+            sbert_encode = f.udf(lambda x: sbert_model.encode(tokenizer_decode(x)))
+        else:
+            sbert_encode = f.udf(lambda x: sbert_model.encode(x))
+
+        self.feature_op = None
+        if isinstance(cols, dict):
+            self.feature_op = FeatureAdd(cols=cols, udfImpl=tokenizer_decode)
+        elif isinstance(cols, list):
+            self.feature_op = FeatureModification(cols=cols, udfImpl=tokenizer_decode)
+        else:
+            raise ValueError(f"{self.op_name} only supports input as list or dict")
+
+    def process(self, df, spark, df_cnt, enable_scala=True, save_path="", per_core_memory_size=0, flush_threshold = 0, enable_gazelle=False):
+        if self.feature_op:
+            df = self.feature_op.process(df, spark, df_cnt, enable_scala, save_path, per_core_memory_size, flush_threshold, enable_gazelle)
+        return df
+
+
 class FillNA(Operation):
     '''
     Operation to fillna to columns
