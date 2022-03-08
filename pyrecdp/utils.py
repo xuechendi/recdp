@@ -38,12 +38,16 @@ def list_dir(path, only_get_one = True):
                         source_path_dict[files] = os.path.join(
                             path, files, file_name)
         except:
-            if not only_get_one:
-                source_path_dict[files] = [os.path.join(path, files)]
-            else:
-                source_path_dict[files] = os.path.join(path, files)
+            if (files.endswith('parquet') or files.endswith('csv')):
+                if not only_get_one:
+                    source_path_dict[files] = [os.path.join(path, files)]
+                else:
+                    source_path_dict[files] = os.path.join(path, files)
     return source_path_dict
 
+def split_array(a, n):
+    k, m = divmod(len(a), n)
+    return (a[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(n))
 
 def parse_size(size):
     units = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30, "TB": 2**40, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}

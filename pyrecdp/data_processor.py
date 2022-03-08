@@ -10,9 +10,11 @@ import pyspark.sql.functions as f
 from pyspark.sql import *
 from pyspark import *
 from pyspark.ml.feature import *
+from typing import Iterator, Tuple
 import os
 import sys
 from timeit import default_timer as timer
+import time
 import logging
 import shutil
 import random
@@ -46,6 +48,9 @@ class Operation:
         raise NotImplementedError(self.op_name + "doesn't support to_dict_dfs")
 
     def process(self, df, spark, df_cnt, enable_scala=True, save_path="", per_core_memory_size=0, flush_threshold = 0, enable_gazelle=False):
+        return df
+
+    def process_with_python(self, df, save_path):
         return df
 
     # some common method
@@ -328,6 +333,22 @@ class FeatureAdd(Operation):
                     before).cast(spk_type.IntegerType()))
         return df
 
+class Repartition(Operation):
+    '''
+    Operation to perform BinaryClassify to columns
+
+    Args:
+
+        cols (dict or list): columns which are be modified
+        default: filled default value
+    '''
+
+    def __init__(self, numPartition):
+        self.op_name = "Repartition"
+        self.numPartition = numPartition
+
+    def process(self, df, spark, df_cnt, enable_scala=True, save_path="", per_core_memory_size=0, flush_threshold = 0, enable_gazelle=False):
+        return df.repartition(self.numPartition)
 
 class BinaryClassify(Operation):
     '''
@@ -371,39 +392,130 @@ class SentenceEmbedding(Operation):
         need_decode: does sentence also need decode
     '''
 
-    def __init__(self, cols, model_name="distiluse-base-multilingual-cased", need_decode=False):
+    def __init__(self, cols, model_name="distiluse-base-multilingual-cased", need_decode=False, parallelism = 4, batch_size = 64):
+        self.need_decode = need_decode
+        self.model_name = model_name
+        self.parallelism = parallelism
+        self.cols = cols
+        self.batch_size = batch_size
         self.op_name = "SentenceEmbedding"
-        if need_decode:
+
+    def get_udf(self, logging = None, batch_iter = None):
+        if logging == None:
+            import logging
+        logging.info(f"prepare models for {self.model_name}-pretrained-model")
+        if self.need_decode:
             from transformers import BertTokenizer
             tokenizer = BertTokenizer.from_pretrained(
                     'bert-base-multilingual-cased', do_lower_case=False)
-            # define UDF
-            tokenizer_decode = f.udf(lambda x: tokenizer.decode(
-                [int(n) for n in x.split('\t')]) if len(x) > 0 else [])
-
         from sentence_transformers import SentenceTransformer
         from os import path
-        if not path.exists(f"{model_name}-pretrained-model"):
-            sbert_model = SentenceTransformer(model_name)
-            sbert_model.save(f"{model_name}-pretrained-model")
+        if not path.exists(f"{self.model_name}-pretrained-model"):
+            sbert_model = SentenceTransformer(self.model_name)
+            sbert_model.save(f"{self.model_name}-pretrained-model")
         else:
-            sbert_model = SentenceTransformer(f"{model_name}-pretrained-model")
-        if need_decode:
-            sbert_encode = f.udf(lambda x: sbert_model.encode(tokenizer_decode(x)))
-        else:
-            sbert_encode = f.udf(lambda x: sbert_model.encode(x))
+            sbert_model = SentenceTransformer(f"{self.model_name}-pretrained-model")
 
-        self.feature_op = None
-        if isinstance(cols, dict):
-            self.feature_op = FeatureAdd(cols=cols, udfImpl=tokenizer_decode)
-        elif isinstance(cols, list):
-            self.feature_op = FeatureModification(cols=cols, udfImpl=tokenizer_decode)
+        def embedsentence(batch_iter: Iterator[pd.Series]) -> Iterator[pd.Series]:
+            
+            def decode_and_clean_tweet_text(x):
+                x = tokenizer.decode([int(n) for n in x.split('\t')])
+                x = x.replace(
+                    'https : / / t. co / ', 'https://t.co/').replace('@ ', '@')
+                return x
+
+            for s in batch_iter:
+                logging.info("start to handle batch Iter")
+                v1s = []
+                printStep = s.size / 10 if (s.size / 10) < 10000 else 10000
+                last = time.time()
+                if self.need_decode:
+                    for index, token in s.items():
+                        if not token or len(token) == 0:
+                            v1s.append([0] * 768)
+                        else:
+                            value = decode_and_clean_tweet_text(token)
+                            v1s.append(value)
+                        if index % printStep == 0:
+                            cur = time.time()
+                            elapse = cur - last
+                            last = cur
+                            logging.info(f"token decode {index}/{s.size} processed, took {elapse:.2f} secs")
+                v2s = sbert_model.encode(v1s, batch_size = self.batch_size)
+                yield pd.Series([np.array2string(i) for i in v2s])
+        if batch_iter:
+            return embedsentence(batch_iter)
+        else:
+            @f.pandas_udf(t.ArrayType(t.DoubleType()))
+            def pudf_embedsentence(batch_iter: Iterator[pd.Series]) -> Iterator[pd.Series]:
+                return embedsentence(batch_iter)
+            return pudf_embedsentence
+
+    def process_with_python(self, df, save_path):
+        if isinstance(self.cols, dict):
+            cols = self.cols
+        elif isinstance(self.cols, list):
+            cols = {}
+            for c in self.cols:
+                cols[c] = c
         else:
             raise ValueError(f"{self.op_name} only supports input as list or dict")
 
+        from multiprocessing import Process
+
+        def execute(in_f_name, out_f_name, in_c_name, out_c_name, executor_id):
+            import logging
+            log_file = f"/tmp/pyrecdp_{in_c_name}.{executor_id}.log"
+            #logging.basicConfig(filename=log_file, level=logging.INFO)
+            logging.basicConfig(level=logging.INFO)
+            logging.info(f"Start to load {in_f_name}")
+            pdf = pd.read_parquet(in_f_name)
+            logging.info(f"EXECUTE[{executor_id}] {in_f_name} loaded")
+            batch_iter = iter([pdf[in_c_name]])
+            out_batch_iter = self.get_udf(logging, batch_iter)
+            for s in out_batch_iter:
+                pdf[out_c_name] = s
+                pdf.to_parquet(out_f_name)
+                logging.info(f"EXECUTE[{executor_id}] {out_f_name} saved")
+
+        def execute_list(to_process_list, executor_id):
+            for in_f_name, out_f_name, in_c_name, out_c_name in to_process_list:
+                print(f"EXECUTOR[{executor_id}] to process {in_f_name} {in_c_name} to {out_f_name}")
+                execute(in_f_name, out_f_name, in_c_name, out_c_name, executor_id)
+
+        parallelism = self.parallelism
+        to_process_list = []
+        process_list = []
+
+        for in_c_name, out_c_name in cols.items():
+            for n, in_f_name in df.file_list.items():
+                out_f_name = f"{save_path}/{n}"
+                to_process_list.append((in_f_name, out_f_name, in_c_name, out_c_name))
+
+        executor_id = 0
+        for sub_list in split_array(to_process_list, parallelism):
+            p = Process(target=execute_list, args=(sub_list, executor_id))
+            process_list.append(p)
+            executor_id += 1
+            p.start()   
+
+        for p in process_list:
+            p.join()
+
+        return df
+        
     def process(self, df, spark, df_cnt, enable_scala=True, save_path="", per_core_memory_size=0, flush_threshold = 0, enable_gazelle=False):
-        if self.feature_op:
-            df = self.feature_op.process(df, spark, df_cnt, enable_scala, save_path, per_core_memory_size, flush_threshold, enable_gazelle)
+        embedsentence = self.get_udf()
+
+        if isinstance(self.cols, dict):
+            for n_c, o_c in self.cols.items():
+                df = df.withColumn(n_c, embedsentence(f.col(o_c)))
+        elif isinstance(self.cols, list):
+            for c in self.cols:
+                df = df.withColumn(c, embedsentence(f.col(c)))
+        else:
+            raise ValueError(f"{self.op_name} only supports input as list or dict")
+
         return df
 
 
@@ -626,7 +738,7 @@ class Categorify(Operation):
         def largest_freq_encode(x):
             broadcast_data = broadcast_dict.value
             min_val = None
-            if x != '':
+            if x and x != '':
                 x_l = x.split(sep) if not isinstance(x, list) else x
                 for v in x_l:
                     if v != '' and v in broadcast_data and (min_val == None or broadcast_data[v] < min_val):
@@ -636,7 +748,7 @@ class Categorify(Operation):
         def freq_encode(x):
             broadcast_data = broadcast_dict.value
             val = []
-            if x != '':
+            if x and x != '':
                 x_l = x.split(sep) if not isinstance(x, list) else x
                 for v in x_l:
                     if v != '' and v in broadcast_data:
@@ -1129,7 +1241,6 @@ class DataProcessor:
                                           self.current_path, df_name)
             print(f"save data to {save_path}")
             if self.enable_gazelle:
-                #df.write.format('parquet').mode('overwrite').save(save_path)
                 df.write.format('arrow').mode('overwrite').save(save_path)
                 return self.spark.read.format("arrow").load(save_path)
             else:
@@ -1163,8 +1274,24 @@ class DataProcessor:
         self.ops = []
         return df
 
+    def apply_with_python(self, df, save_path):
+        for op in self.ops:
+            df = op.process_with_python(df, save_path)
+        self.ops = []
+        return df
+
     def transform(self, df, name="materialized_tmp", df_cnt = None):
-        return self.materialize(self.apply(df, df_cnt), df_name=name)
+        if isinstance(df, ExtendedDataFrame):
+            save_path = ""
+            if name == "materialized_tmp":
+                save_path = self.get_tmp_cache_path()
+                self.tmp_materialzed_list.append(save_path)
+            else:
+                save_path = "%s/%s" % (self.current_path, name)
+            print(f"save data to {save_path}")
+            return self.apply_with_python(df, save_path)
+        else:
+            return self.materialize(self.apply(df, df_cnt), df_name=name)
 
     def generate_dicts(self, df):
         # flat ops to dfs
@@ -1189,7 +1316,7 @@ class DataProcessor:
             if op.op_name != "GenerateDictionary":
                 raise NotImplementedError(
                     "We haven't support apply generate_dict to not GenerateDictionary operator yet.")
-            save_path = get_tmp_cache_path()
+            save_path = self.get_tmp_cache_path()
             dfs.extend(op.merge_dict(op.to_dict_dfs(df, self.spark, save_path, self.enable_gazelle), to_merge_dict_dfs))
         for dict_df in dfs:
             materialized_dfs.append({'col_name': dict_df['col_name'], 'dict': self.materialize(
@@ -1204,3 +1331,10 @@ class DataProcessor:
             op = self.refine_op(op, df, save_path)
             df = op.process(df, self.spark, df_cnt, self.enable_scala, save_path=save_path, per_core_memory_size = self.per_core_memory_size, flush_threshold = self.flush_threshold, enable_gazelle=self.enable_gazelle)
         df.show(vertical = vertical, truncate = truncate)
+
+
+class ExtendedDataFrame:
+    def __init__(self, data_path):
+        self.data_path = data_path
+        self.file_list = list_dir(data_path)
+        print(self.file_list)
